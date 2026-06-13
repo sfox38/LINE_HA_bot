@@ -20,7 +20,8 @@
     "error": {
       "invalid_token": "채널 액세스 토큰을 확인할 수 없습니다. 확인 후 다시 시도하세요.",
       "invalid_secret": "채널 시크릿은 비워둘 수 없습니다.",
-      "cannot_connect": "LINE API에 연결하지 못했습니다. 네트워크 연결을 확인하세요."
+      "cannot_connect": "LINE API에 연결하지 못했습니다. 네트워크 연결을 확인하세요.",
+      "confirm_required": "계속하기 전에 Webhook이 설정되었음을 확인하는 체크박스를 선택하세요."
     },
     "abort": {
       "already_configured": "LINE Bot이 이미 구성되어 있습니다.",
@@ -31,8 +32,31 @@
     "step": {
       "init": {
         "title": "LINE 메시징 옵션",
+        "menu_options": {
+          "add_recipient": "수신자 추가",
+          "remove_recipient": "수신자 제거",
+          "rotate_token": "자격 증명 업데이트"
+        }
+      },
+      "add_recipient": {
+        "title": "수신자 추가",
+        "description": "수신자가 LINE에서 봇을 친구로 추가하고 메시지를 보내도록 하세요. 메시지를 받으면 이 화면이 자동으로 다음 단계로 진행됩니다."
+      },
+      "select_recipient": {
+        "title": "수신자 선택",
+        "description": "추가할 계정을 선택하세요. '[대기 중인 항목 모두 지우기]'를 선택하면 캡처된 모든 계정을 삭제합니다.",
         "data": {
-          "action": "무엇을 하시겠습니까?"
+          "user_id": "LINE 계정",
+          "clear_pending": "[대기 중인 항목 모두 지우기]"
+        }
+      },
+      "name_recipient": {
+        "title": "수신자 이름 설정",
+        "description": "**{line_name}**의 이름을 설정합니다.\n\nHome Assistant에서 사용할 ASCII 이름을 입력하세요(엔티티 ID가 됩니다). HA UI에 표시될 표시 이름(모든 언어 또는 이모지)을 선택적으로 입력할 수 있습니다.",
+        "data": {
+          "recipient_name": "Home Assistant에서의 이름 (예: 철수, 영희, 민준)",
+          "friendly_name": "표시 이름 (모든 언어 또는 이모지)",
+          "add_another": "이 수신자를 저장한 후 다른 수신자 추가"
         }
       },
       "remove_recipient": {
@@ -48,22 +72,10 @@
           "channel_access_token": "채널 액세스 토큰",
           "channel_secret": "채널 시크릿"
         }
-      },
-      "select_recipient": {
-        "title": "수신자 선택",
-        "description": "추가할 계정을 선택하세요. Home Assistant용 ASCII 엔티티 이름과 HA UI에 표시될 표시 이름(이모지 및 모든 언어 지원)을 입력하세요. '[대기 중인 항목 모두 지우기]'를 선택하면 캡처된 모든 계정을 삭제합니다.",
-        "data": {
-          "user_id": "LINE 계정",
-          "recipient_name": "Home Assistant에서의 이름 (예: 철수, 영희, 민준)",
-          "add_another": "이 수신자를 저장한 후 다른 수신자 추가",
-          "friendly_name": "표시 이름 (모든 언어 또는 이모지)",
-          "clear_pending": "[대기 중인 항목 모두 지우기]"
-        }
       }
     },
     "error": {
       "invalid_token": "채널 액세스 토큰을 확인할 수 없습니다. 확인 후 다시 시도하세요.",
-      "no_message_received": "아직 메시지를 받지 못했습니다. 상대방이 봇을 친구로 추가하고 메시지를 보냈는지 확인한 후 Submit을 다시 클릭하세요.",
       "duplicate_name": "이 이름(또는 매우 유사한 이름)의 수신자가 이미 존재합니다.",
       "duplicate_user_id": "이 LINE 계정은 이미 추가되어 있습니다.",
       "cannot_connect": "LINE API에 연결하지 못했습니다. 네트워크 연결을 확인하세요.",

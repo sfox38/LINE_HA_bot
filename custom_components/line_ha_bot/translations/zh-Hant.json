@@ -20,7 +20,8 @@
     "error": {
       "invalid_token": "無法驗證頻道存取權杖。請檢查後重試。",
       "invalid_secret": "頻道金鑰不可為空。",
-      "cannot_connect": "無法連線至 LINE API。請檢查您的網路連線。"
+      "cannot_connect": "無法連線至 LINE API。請檢查您的網路連線。",
+      "confirm_required": "請勾選核取方塊以確認 Webhook 已設定完成，再繼續進行。"
     },
     "abort": {
       "already_configured": "LINE Bot 已完成設定。",
@@ -31,8 +32,31 @@
     "step": {
       "init": {
         "title": "LINE 訊息選項",
+        "menu_options": {
+          "add_recipient": "新增收件人",
+          "remove_recipient": "移除收件人",
+          "rotate_token": "更新憑證"
+        }
+      },
+      "add_recipient": {
+        "title": "新增收件人",
+        "description": "請讓收件人在 LINE 中將您的 Bot 加為好友並傳送任意訊息。收到訊息後，此畫面將自動進入下一步。"
+      },
+      "select_recipient": {
+        "title": "選擇收件人",
+        "description": "選擇要新增的帳號。選擇「[清除所有待處理]」可捨棄所有已擷取的帳號。",
         "data": {
-          "action": "您想執行什麼操作？"
+          "user_id": "LINE 帳號",
+          "clear_pending": "[清除所有待處理]"
+        }
+      },
+      "name_recipient": {
+        "title": "為收件人命名",
+        "description": "正在為 **{line_name}** 命名。\n\n請輸入用於 Home Assistant 的 ASCII 名稱（這將成為實體 ID）。也可選擇性輸入顯示在 HA 介面中的名稱，可使用任何語言或 emoji。",
+        "data": {
+          "recipient_name": "在 Home Assistant 中的名稱（例如：大明、小花、阿志）",
+          "friendly_name": "顯示名稱（任何語言或 emoji）",
+          "add_another": "儲存此收件人後繼續新增另一位"
         }
       },
       "remove_recipient": {
@@ -48,22 +72,10 @@
           "channel_access_token": "頻道存取權杖",
           "channel_secret": "頻道金鑰"
         }
-      },
-      "select_recipient": {
-        "title": "選擇收件人",
-        "description": "選擇要新增的帳號。輸入 Home Assistant 的 ASCII 實體名稱，以及在 HA 介面中顯示的名稱（支援 emoji 和任何語言）。選擇「[清除所有待處理]」可捨棄所有已擷取的帳號。",
-        "data": {
-          "user_id": "LINE 帳號",
-          "recipient_name": "在 Home Assistant 中的名稱（例如：大明、小花、阿志）",
-          "add_another": "儲存此收件人後繼續新增另一位",
-          "friendly_name": "顯示名稱（任何語言或 emoji）",
-          "clear_pending": "[清除所有待處理]"
-        }
       }
     },
     "error": {
       "invalid_token": "無法驗證頻道存取權杖。請檢查後重試。",
-      "no_message_received": "尚未收到任何訊息。請確認對方已將您的 Bot 加為好友並傳送訊息，然後再次點擊「Submit」。",
       "duplicate_name": "已存在相同名稱（或非常相似的名稱）的收件人。",
       "duplicate_user_id": "此 LINE 帳號已被新增。",
       "cannot_connect": "無法連線至 LINE API。請檢查您的網路連線。",

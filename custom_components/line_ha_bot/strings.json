@@ -20,7 +20,8 @@
     "error": {
       "invalid_token": "Could not verify the channel access token. Please check it and try again.",
       "invalid_secret": "Channel secret cannot be empty.",
-      "cannot_connect": "Failed to connect to LINE API. Check your network connection."
+      "cannot_connect": "Failed to connect to LINE API. Check your network connection.",
+      "confirm_required": "Please tick the checkbox to confirm the webhook is set up before continuing."
     },
     "abort": {
       "already_configured": "LINE Bot is already configured.",
@@ -31,8 +32,31 @@
     "step": {
       "init": {
         "title": "LINE Messaging Options",
+        "menu_options": {
+          "add_recipient": "Add recipient",
+          "remove_recipient": "Remove recipient",
+          "rotate_token": "Update credentials"
+        }
+      },
+      "add_recipient": {
+        "title": "Add Recipient",
+        "description": "Have the recipient add your bot as a friend in LINE and send it any message. Once their message is received, this screen will automatically advance to the next step."
+      },
+      "select_recipient": {
+        "title": "Select Recipient",
+        "description": "Select the account to add. Select '[Clear all pending]' to discard all captured accounts.",
         "data": {
-          "action": "What would you like to do?"
+          "user_id": "LINE Account",
+          "clear_pending": "[Clear all pending]"
+        }
+      },
+      "name_recipient": {
+        "title": "Name Recipient",
+        "description": "Naming **{line_name}**.\n\nEnter an ASCII name for use in Home Assistant (this becomes the entity ID). Optionally enter a display name shown in the HA UI — it can be in any language or include emoji.",
+        "data": {
+          "recipient_name": "Name in Home Assistant (e.g. David, Greta, Coolio)",
+          "friendly_name": "Display name (any language or emoji)",
+          "add_another": "Add another recipient after saving this one"
         }
       },
       "remove_recipient": {
@@ -48,22 +72,10 @@
           "channel_access_token": "Channel Access Token",
           "channel_secret": "Channel Secret"
         }
-      },
-      "select_recipient": {
-        "title": "Select Recipient",
-        "description": "Select the account to add. Enter an ASCII entity name for Home Assistant and an optional display name shown in the HA UI (supports emoji and any language). Select '[Clear all pending]' to discard all captured accounts.",
-        "data": {
-          "user_id": "LINE Account",
-          "recipient_name": "Name in Home Assistant (e.g. David, Greta, Coolio)",
-          "add_another": "Add another recipient after saving this one",
-          "friendly_name": "Display name (any language or emoji)",
-          "clear_pending": "[Clear all pending]"
-        }
       }
     },
     "error": {
       "invalid_token": "Could not verify the channel access token. Please check it and try again.",
-      "no_message_received": "No messages received yet. Make sure the person has added your bot and sent it a message, then click Submit again.",
       "duplicate_name": "A recipient with this name (or a very similar name) already exists.",
       "duplicate_user_id": "This LINE account has already been added.",
       "cannot_connect": "Failed to connect to LINE API. Check your network connection.",

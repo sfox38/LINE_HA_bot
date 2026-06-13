@@ -20,7 +20,8 @@
     "error": {
       "invalid_token": "ไม่สามารถยืนยัน Channel Access Token ได้ กรุณาตรวจสอบแล้วลองอีกครั้ง",
       "invalid_secret": "Channel Secret ต้องไม่ว่างเปล่า",
-      "cannot_connect": "ไม่สามารถเชื่อมต่อ LINE API ได้ ตรวจสอบการเชื่อมต่อเครือข่ายของคุณ"
+      "cannot_connect": "ไม่สามารถเชื่อมต่อ LINE API ได้ ตรวจสอบการเชื่อมต่อเครือข่ายของคุณ",
+      "confirm_required": "กรุณาติ๊กช่องเพื่อยืนยันว่าได้ตั้งค่า Webhook แล้วก่อนดำเนินการต่อ"
     },
     "abort": {
       "already_configured": "LINE Bot ได้รับการกำหนดค่าแล้ว",
@@ -31,8 +32,31 @@
     "step": {
       "init": {
         "title": "ตัวเลือก LINE Messaging",
+        "menu_options": {
+          "add_recipient": "เพิ่มผู้รับ",
+          "remove_recipient": "ลบผู้รับ",
+          "rotate_token": "อัปเดตข้อมูลรับรอง"
+        }
+      },
+      "add_recipient": {
+        "title": "เพิ่มผู้รับ",
+        "description": "ให้ผู้รับเพิ่มบอทของคุณเป็นเพื่อนใน LINE และส่งข้อความใดๆ เมื่อได้รับข้อความแล้ว หน้าจอนี้จะดำเนินการต่อไปยังขั้นตอนถัดไปโดยอัตโนมัติ"
+      },
+      "select_recipient": {
+        "title": "เลือกผู้รับ",
+        "description": "เลือกบัญชีที่ต้องการเพิ่ม เลือก '[ล้างรายการที่รอดำเนินการทั้งหมด]' เพื่อยกเลิกบัญชีที่บันทึกไว้ทั้งหมด",
         "data": {
-          "action": "คุณต้องการทำอะไร?"
+          "user_id": "บัญชี LINE",
+          "clear_pending": "[ล้างรายการที่รอดำเนินการทั้งหมด]"
+        }
+      },
+      "name_recipient": {
+        "title": "ตั้งชื่อผู้รับ",
+        "description": "กำลังตั้งชื่อให้ **{line_name}**\n\nป้อนชื่อ ASCII สำหรับ Home Assistant (ชื่อนี้จะกลายเป็น entity ID) และอาจป้อนชื่อที่แสดงผลใน HA UI ด้วยก็ได้ — รองรับทุกภาษาหรือ emoji",
+        "data": {
+          "recipient_name": "ชื่อใน Home Assistant (เช่น สมชาย, มาลี, น้องเล็ก)",
+          "friendly_name": "ชื่อที่แสดงผล (ทุกภาษาหรือ emoji)",
+          "add_another": "เพิ่มผู้รับอีกคนหลังจากบันทึกรายการนี้"
         }
       },
       "remove_recipient": {
@@ -48,22 +72,10 @@
           "channel_access_token": "Channel Access Token",
           "channel_secret": "Channel Secret"
         }
-      },
-      "select_recipient": {
-        "title": "เลือกผู้รับ",
-        "description": "เลือกบัญชีที่ต้องการเพิ่ม ป้อนชื่อ entity แบบ ASCII สำหรับ Home Assistant และชื่อที่แสดงผลที่ต้องการ (รองรับ emoji และทุกภาษา) เลือก '[ล้างรายการที่รอดำเนินการทั้งหมด]' เพื่อยกเลิกบัญชีที่บันทึกไว้ทั้งหมด",
-        "data": {
-          "user_id": "บัญชี LINE",
-          "recipient_name": "ชื่อใน Home Assistant (เช่น สมชาย, มาลี, น้องเล็ก)",
-          "add_another": "เพิ่มผู้รับอีกคนหลังจากบันทึกรายการนี้",
-          "friendly_name": "ชื่อที่แสดงผล (ทุกภาษาหรือ emoji)",
-          "clear_pending": "[ล้างรายการที่รอดำเนินการทั้งหมด]"
-        }
       }
     },
     "error": {
       "invalid_token": "ไม่สามารถยืนยัน Channel Access Token ได้ กรุณาตรวจสอบแล้วลองอีกครั้ง",
-      "no_message_received": "ยังไม่ได้รับข้อความใดๆ ตรวจสอบให้แน่ใจว่าบุคคลนั้นได้เพิ่มบอทของคุณเป็นเพื่อนและส่งข้อความแล้ว จากนั้นคลิก Submit อีกครั้ง",
       "duplicate_name": "มีผู้รับที่มีชื่อนี้ (หรือชื่อที่คล้ายกันมาก) อยู่แล้ว",
       "duplicate_user_id": "บัญชี LINE นี้ถูกเพิ่มไปแล้ว",
       "cannot_connect": "ไม่สามารถเชื่อมต่อ LINE API ได้ ตรวจสอบการเชื่อมต่อเครือข่ายของคุณ",

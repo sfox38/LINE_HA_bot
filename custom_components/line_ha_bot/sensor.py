@@ -1,14 +1,17 @@
 """LINE Bot sensor platform for Home Assistant.
 
-Provides two sensors per config entry:
+Provides two diagnostic sensors per config entry:
   - Monthly message limit (from LINE plan, rarely changes)
   - Monthly message consumption (messages sent so far this month)
 
-Both sensors poll the LINE Messaging API once per hour.
+Both sensors poll the LINE Messaging API once per hour via a shared
+DataUpdateCoordinator. Plans with no limit (quota type "none") report
+no limit value rather than 0.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -16,6 +19,7 @@ import aiohttp
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -36,6 +40,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(hours=1)
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 async def async_setup_entry(
@@ -44,9 +49,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up LINE Bot quota sensors from a config entry."""
-    token = entry.data[CONF_CHANNEL_ACCESS_TOKEN]
-
-    coordinator = LineQuotaCoordinator(hass, token)
+    coordinator = LineQuotaCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
 
     async_add_entities([
@@ -58,45 +61,41 @@ async def async_setup_entry(
 class LineQuotaCoordinator(DataUpdateCoordinator):
     """Coordinator that fetches LINE quota and consumption once per hour."""
 
-    def __init__(self, hass: HomeAssistant, token: str) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name="LINE Bot quota",
             update_interval=SCAN_INTERVAL,
         )
-        self._token = token
+        self._token = entry.data[CONF_CHANNEL_ACCESS_TOKEN]
 
-    async def _async_update_data(self) -> dict:
-        """Fetch quota and consumption from LINE API."""
+    async def _fetch_json(self, url: str, label: str) -> dict:
+        """GET one LINE API endpoint, raising UpdateFailed on a non-200 status."""
         session = async_get_clientsession(self.hass)
         headers = {"Authorization": f"Bearer {self._token}"}
+        async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status != 200:
+                raise UpdateFailed(f"LINE {label} API returned HTTP {resp.status}")
+            return await resp.json()
+
+    async def _async_update_data(self) -> dict:
+        """Fetch quota and consumption from the LINE API in parallel."""
         try:
-            async with session.get(
-                LINE_QUOTA_URL,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    raise UpdateFailed(f"LINE quota API returned HTTP {resp.status}")
-                quota_data = await resp.json()
-
-            async with session.get(
-                LINE_QUOTA_CONSUMPTION_URL,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    raise UpdateFailed(f"LINE consumption API returned HTTP {resp.status}")
-                consumption_data = await resp.json()
-
-            return {
-                "limit": quota_data.get("value", 0),
-                "type": quota_data.get("type", "unknown"),
-                "consumption": consumption_data.get("totalUsage", 0),
-            }
+            quota_data, consumption_data = await asyncio.gather(
+                self._fetch_json(LINE_QUOTA_URL, "quota"),
+                self._fetch_json(LINE_QUOTA_CONSUMPTION_URL, "consumption"),
+            )
         except aiohttp.ClientError as err:
             raise UpdateFailed(f"LINE Bot quota fetch error: {err}") from err
+
+        # Quota type "none" means the plan has no limit; "value" is then absent.
+        return {
+            "limit": quota_data.get("value"),
+            "type": quota_data.get("type", "unknown"),
+            "consumption": consumption_data.get("totalUsage", 0),
+        }
 
 
 class LineQuotaLimitSensor(CoordinatorEntity, SensorEntity):
@@ -105,6 +104,7 @@ class LineQuotaLimitSensor(CoordinatorEntity, SensorEntity):
     _attr_icon = "mdi:message-badge-outline"
     _attr_native_unit_of_measurement = "messages"
     _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: LineQuotaCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -137,6 +137,7 @@ class LineQuotaConsumptionSensor(CoordinatorEntity, SensorEntity):
     _attr_native_unit_of_measurement = "messages"
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: LineQuotaCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -159,7 +160,8 @@ class LineQuotaConsumptionSensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict:
         if self.coordinator.data is None:
             return {}
-        limit = self.coordinator.data.get("limit", 0)
+        limit = self.coordinator.data.get("limit")
         consumption = self.coordinator.data.get("consumption", 0)
+        # remaining is None on plans with no limit (quota type "none")
         remaining = max(0, limit - consumption) if limit else None
         return {"remaining": remaining}

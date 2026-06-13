@@ -1,6 +1,6 @@
 send_message:
   name: Send LINE message
-  description: Send a message to one or more LINE recipients, with optional image, sticker, flex card, or location.
+  description: Send a message to one or more LINE recipients, with optional image, audio, video, sticker, location, flex card, button/confirm template, and quick replies.
   fields:
     entity_id:
       name: Entity
@@ -9,7 +9,9 @@ send_message:
       example: notify.line_bot_david
       selector:
         entity:
-          domain: notify
+          filter:
+            integration: line_ha_bot
+            domain: notify
     message:
       name: Message
       description: The text message to send. Optional if flex_message or a location is provided.
@@ -47,7 +49,7 @@ send_message:
         text:
     reply_token:
       name: Reply token
-      description: Reply token from a line_bot_message_received event. Uses the free Reply API instead of Push. Valid for 30 seconds and single-use only.
+      description: Reply token from a line_bot_message_received event. Uses the free Reply API instead of Push for the first target; the reply is delivered to the chat the token came from. Valid for 30 seconds and single-use only. If the reply fails, the send automatically falls back to the Push API.
       required: false
       example: "{{ trigger.event.data.reply_token }}"
       selector:
@@ -133,7 +135,7 @@ send_message:
         object:
     audio_url:
       name: Audio URL
-      description: URL of an M4A audio file to send. Takes priority over video, file, and sticker if provided.
+      description: URL of an M4A audio file to send. Takes priority over video and sticker if provided.
       required: false
       example: https://example.com/audio.m4a
       selector:
@@ -145,13 +147,13 @@ send_message:
       example: "5000"
       selector:
         number:
-          min: 0
+          min: 1
           max: 600000
           step: 1
           mode: box
     video_url:
       name: Video URL
-      description: URL of a video file to send. Takes priority over file and sticker if provided.
+      description: URL of a video file to send. Takes priority over sticker if provided.
       required: false
       example: https://example.com/video.mp4
       selector:

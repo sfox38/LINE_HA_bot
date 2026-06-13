@@ -5,15 +5,19 @@ This module handles all UI-driven configuration via the HA integrations page.
 Config flow steps (initial setup) - intentionally minimal:
   1. user          - Enter Channel Access Token and Channel Secret.
   2. webhook_info  - Display the webhook URL to paste into LINE Developers Console.
-                     The config entry is created on Submit. Recipients are added
-                     separately via the options flow after setup completes.
+                     The config entry is created on Submit once the confirmation
+                     checkbox is ticked. Recipients are added separately via the
+                     options flow after setup completes.
 
 Options flow steps (accessed via the gear icon on the integration card):
   init             - Menu: Add recipient / Remove recipient / Update credentials.
   add_recipient    - Progress spinner waiting for a LINE message or group event.
                      Skips spinner if messages are already captured in pending_users.
-  select_recipient - Dropdown of captured LINE users and groups; enter an HA name.
-                     Includes "Clear all pending" sentinel and "Add another" checkbox.
+  select_recipient - Dropdown of captured LINE users and groups, including a
+                     "Clear all pending" sentinel.
+  name_recipient   - Enter an HA entity name and display name for the selected
+                     account, with suggestions derived from its LINE display name.
+                     Includes an "Add another" checkbox.
   remove_recipient - Dropdown of current recipients to delete.
   rotate_token     - Update Channel Access Token and/or Channel Secret.
 
@@ -24,17 +28,18 @@ Recipient storage format:
   "U" and type "user". The type is detected automatically from the LINE ID prefix.
 
 Recipient name rules:
-  Names must contain only ASCII letters, digits, spaces, hyphens, and underscores.
-  Non-ASCII characters (Thai, emoji, etc.) are rejected with a clear error message.
-  The _sanitize_name() helper suggests a safe default: emojis are converted to their
-  Unicode name (e.g. nerd), non-ASCII scripts are romanized via slugify().
+  Names must contain only ASCII letters, digits, spaces, hyphens, and underscores,
+  and must produce a non-empty slug. Non-ASCII characters (Thai, emoji, etc.) are
+  rejected with a clear error message. The _sanitize_name() helper suggests a safe
+  default: emojis are converted to their Unicode name (e.g. nerd), non-ASCII
+  scripts are romanized via slugify().
 
 Webhook-based capture:
   The permanent webhook in __init__.py captures LINE user IDs and group IDs into
-  the per-entry hass.data[DOMAIN][entry_id][PENDING_USERS_KEY] dict whenever
-  someone messages the bot or sends a message in a registered group. The options
-  flow polls this dict every 2 seconds and automatically advances to the select
-  step when a user or group appears.
+  the per-entry runtime pending_users dict whenever someone messages the bot or
+  sends a message in a registered group. The options flow waits on the runtime
+  pending_event (with a polling fallback) and automatically advances to the
+  select step when a user or group appears.
 """
 
 import asyncio
@@ -66,21 +71,16 @@ from .const import (
     LINE_TOKEN_VERIFY_URL,
     LINE_WEBHOOK_PATH,
     PENDING_USERS_KEY,
-    KEY_VIEW_REGISTERED,
     CLEAR_PENDING,
     CLEAR_PENDING_LABEL,
     RECIPIENTS_KEY,
 )
 
-CONF_ACTION = "action"
-ACTION_ADD = "add_recipient"
-ACTION_REMOVE = "remove_recipient"
-ACTION_ROTATE = "rotate_token"
-
 CONF_ADD_ANOTHER = "add_another"
 
-# Polling task: checks every _POLL_INTERVAL seconds for up to _POLL_ITERATIONS cycles.
-# Total wait time: 300 * 2 = 600 seconds (10 minutes).
+# Polling fallback: checks every _POLL_INTERVAL seconds for up to
+# _POLL_ITERATIONS cycles. Total wait time: 300 * 2 = 600 seconds (10 minutes).
+# The webhook's pending_event normally wakes the wait immediately.
 _POLL_ITERATIONS = 300
 _POLL_INTERVAL = 2
 
@@ -120,9 +120,15 @@ def _get_external_url(hass: HomeAssistant) -> str | None:
 def _is_valid_name(name: str) -> bool:
     """Return True if name is safe to use as an HA recipient name.
 
-    Accepts only ASCII letters, digits, spaces, hyphens, and underscores.
+    Accepts only ASCII letters, digits, spaces, hyphens, and underscores,
+    and requires that the name produces a non-empty slug (so names made up
+    of only spaces, hyphens, or underscores are rejected).
     """
-    return bool(name) and bool(re.match(r'^[a-zA-Z0-9 _-]+$', name))
+    return (
+        bool(name)
+        and bool(re.match(r'^[a-zA-Z0-9 _-]+$', name))
+        and bool(slugify(name))
+    )
 
 
 def _name_slug_conflicts(name: str, existing_names: dict) -> bool:
@@ -135,9 +141,10 @@ def _name_slug_conflicts(name: str, existing_names: dict) -> bool:
 
 
 def _is_emoji(char: str) -> bool:
-    """Return True if char is an emoji or pictographic symbol.
+    """Return True if char is in one of the common emoji Unicode blocks.
 
-    Uses Unicode block ranges to detect emoji characters.
+    Best-effort coverage of the most common blocks; characters outside these
+    ranges (e.g. flags, arrows) are simply dropped by slugify() later.
     """
     cp = ord(char)
     return (
@@ -160,10 +167,10 @@ def _sanitize_name(display_name: str) -> str:
          Japanese, and other non-ASCII scripts and produces a safe ASCII slug.
 
     Examples:
-      "David"           -> "David"
-      "สวัสดี"           -> "sawasdi" (or similar romanization)
+      "David"           -> "david"
+      "สวัสดี"           -> "swasdii"
       "🤓"              -> "nerd"
-      "สวัสดี 🤓 David" -> "sawasdi_nerd_david"
+      "สวัสดี 🤓 David" -> "swasdii_nerd_david"
     """
     parts = []
     for char in display_name:
@@ -188,6 +195,7 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     Intentionally kept to two steps: credentials and webhook setup.
     The config entry is created with empty recipients after webhook verification.
     All recipient management is done via the options flow after installation.
+    Only one instance is allowed, enforced via single_config_entry in the manifest.
     """
 
     VERSION = 1
@@ -201,26 +209,23 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Step 1: Collect and verify LINE API credentials.
 
         Asks for the Channel Access Token and Channel Secret, both found on the
-        Basic Settings tab of the LINE Developers Console. Verifies the token
-        against LINE's oauth endpoint before proceeding. Only one instance of
-        this integration is allowed (enforced via unique_id).
+        Basic Settings tab of the LINE Developers Console. Checks the secret is
+        non-empty before verifying the token against LINE's oauth endpoint.
         """
-        await self.async_set_unique_id(DOMAIN)
-        self._abort_if_unique_id_configured()
-
         errors = {}
         if user_input is not None:
             token = user_input[CONF_CHANNEL_ACCESS_TOKEN].strip()
             secret = user_input[CONF_CHANNEL_SECRET].strip()
-            error = await _verify_token(self.hass, token)
-            if error:
-                errors["base"] = error
-            elif not secret:
+            if not secret:
                 errors[CONF_CHANNEL_SECRET] = "invalid_secret"
             else:
-                self._token = token
-                self._secret = secret
-                return await self.async_step_webhook_info()
+                error = await _verify_token(self.hass, token)
+                if error:
+                    errors["base"] = error
+                else:
+                    self._token = token
+                    self._secret = secret
+                    return await self.async_step_webhook_info()
 
         return self.async_show_form(
             step_id="user",
@@ -235,11 +240,11 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Step 2: Show webhook URL and create the config entry on Submit.
 
         Registers the webhook view immediately so LINE's Verify button succeeds
-        before the user clicks Submit. The config entry is created with empty
-        recipients. Recipients are added via the options flow (gear icon) after
-        installation.
+        before the user clicks Submit. The confirmation checkbox must be ticked.
+        The config entry is created with empty recipients. Recipients are added
+        via the options flow (gear icon) after installation.
         """
-        from . import LineMessagingWebhookView
+        from . import _async_register_webhook
 
         external_url = _get_external_url(self.hass)
         if external_url is None:
@@ -247,26 +252,27 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         webhook_url = f"{external_url}{LINE_WEBHOOK_PATH}"
 
-        self.hass.data.setdefault(DOMAIN, {})
-        if not self.hass.data[DOMAIN].get(KEY_VIEW_REGISTERED):
-            self.hass.http.register_view(LineMessagingWebhookView(self.hass))
-            self.hass.data[DOMAIN][KEY_VIEW_REGISTERED] = True
+        _async_register_webhook(self.hass)
 
+        errors = {}
         if user_input is not None:
-            return self.async_create_entry(
-                title="LINE Bot",
-                data={
-                    CONF_CHANNEL_ACCESS_TOKEN: self._token,
-                    CONF_CHANNEL_SECRET: self._secret,
-                    RECIPIENTS_KEY: {},
-                },
-            )
+            if user_input.get("confirmed"):
+                return self.async_create_entry(
+                    title="LINE Bot",
+                    data={
+                        CONF_CHANNEL_ACCESS_TOKEN: self._token,
+                        CONF_CHANNEL_SECRET: self._secret,
+                        RECIPIENTS_KEY: {},
+                    },
+                )
+            errors["confirmed"] = "confirm_required"
 
         return self.async_show_form(
             step_id="webhook_info",
             data_schema=vol.Schema({
                 vol.Optional("confirmed", default=False): bool,
             }),
+            errors=errors,
             description_placeholders={"webhook_url": webhook_url},
         )
 
@@ -274,13 +280,13 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(config_entry):
         """Return the options flow handler for this config entry."""
-        return LineMessagingOptionsFlow(config_entry)
+        return LineMessagingOptionsFlow()
 
 
 class LineMessagingOptionsFlow(config_entries.OptionsFlow):
     """Handle the options flow for LINE Bot (gear icon on the integration card).
 
-    Provides three actions:
+    Provides three actions via a translatable menu:
       - Add a recipient:       Webhook-based capture flow with spinner.
       - Remove a recipient:    Dropdown of current recipients to delete.
       - Update credentials:    Replace the Channel Access Token and/or Channel Secret.
@@ -289,35 +295,25 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
     __init__.py triggers a reload so notify entities reflect the new state.
     """
 
-    def __init__(self, config_entry):
-        """Initialise with the current config entry state."""
-        self._config_entry = config_entry
-        self._recipients: dict[str, dict] = dict(config_entry.data.get(RECIPIENTS_KEY, {}))
-        self._token = config_entry.data.get(CONF_CHANNEL_ACCESS_TOKEN, "")
-        self._secret = config_entry.data.get(CONF_CHANNEL_SECRET, "")
+    def __init__(self):
+        """Initialise flow state. Entry data is loaded lazily in async_step_init."""
+        self._recipients: dict[str, dict] | None = None
+        self._token = ""
+        self._secret = ""
         self._poll_task: asyncio.Task | None = None
+        self._selected_uid: str | None = None
 
     async def async_step_init(self, user_input=None) -> FlowResult:
-        """Show the action menu: Add / Remove / Update token."""
-        if user_input is not None:
-            action = user_input[CONF_ACTION]
-            if action == ACTION_ADD:
-                return await self.async_step_add_recipient()
-            if action == ACTION_REMOVE:
-                return await self.async_step_remove_recipient()
-            if action == ACTION_ROTATE:
-                return await self.async_step_rotate_token()
+        """Show the action menu: Add / Remove / Update credentials."""
+        if self._recipients is None:
+            data = self.config_entry.data
+            self._recipients = dict(data.get(RECIPIENTS_KEY, {}))
+            self._token = data.get(CONF_CHANNEL_ACCESS_TOKEN, "")
+            self._secret = data.get(CONF_CHANNEL_SECRET, "")
 
-        action_options = {
-            ACTION_ADD: "Add a recipient",
-            ACTION_REMOVE: "Remove a recipient",
-            ACTION_ROTATE: "Update credentials (token and secret)",
-        }
-        return self.async_show_form(
+        return self.async_show_menu(
             step_id="init",
-            data_schema=vol.Schema({
-                vol.Required(CONF_ACTION): vol.In(action_options),
-            }),
+            menu_options=["add_recipient", "remove_recipient", "rotate_token"],
         )
 
     async def async_step_add_recipient(self, user_input=None) -> FlowResult:
@@ -353,31 +349,37 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_progress_done(next_step_id="select_recipient")
 
     async def _poll_for_pending_user(self) -> None:
-        """Background task that polls pending_users until a user ID appears.
+        """Background task that waits until a pending user ID appears.
 
-        Checks every _POLL_INTERVAL seconds for up to _POLL_ITERATIONS cycles.
-        Returns as soon as at least one user ID is present. If the timeout is
-        reached with no user, the task completes with pending_users empty, and
-        select_recipient will redirect back to add_recipient for a fresh poll.
+        Primarily event-driven: the webhook sets the runtime pending_event as
+        soon as it captures a new sender, which wakes this task immediately.
+        Falls back to checking pending_users every _POLL_INTERVAL seconds (the
+        event object is re-fetched each cycle so a config entry reload mid-wait
+        cannot strand the task). Gives up after _POLL_ITERATIONS cycles; the
+        select step then redirects back to add_recipient for a fresh wait.
         """
         for _ in range(_POLL_ITERATIONS):
             if self._get_pending_users():
                 return
-            await asyncio.sleep(_POLL_INTERVAL)
+            event = self._get_pending_event()
+            if event is None:
+                await asyncio.sleep(_POLL_INTERVAL)
+                continue
+            event.clear()
+            try:
+                await asyncio.wait_for(event.wait(), timeout=_POLL_INTERVAL)
+            except TimeoutError:
+                pass
 
     async def async_step_select_recipient(self, user_input=None) -> FlowResult:
-        """Pick a captured LINE account or group, name it, and optionally add another.
+        """Pick a captured LINE account or group from the dropdown.
 
-        Shows two name fields: recipient_name (ASCII only, used for entity ID slugification)
-        and friendly_name (any characters including emoji and unicode, used as the HA
-        display name). friendly_name defaults to the LINE display name. The dropdown
-        includes all pending users and groups plus a "— Clear all pending —" sentinel.
-        The recipient type (user or group) is detected from the LINE ID prefix (U vs C).
-
-        Selecting CLEAR_PENDING wipes pending_users and goes back to the spinner.
-        If pending_users is empty (spinner timed out), goes back to add_recipient.
+        The dropdown lists all pending users and groups plus a "Clear all pending"
+        sentinel (translated via the pending_user selector key). Selecting
+        CLEAR_PENDING wipes pending_users, persists the wipe, and goes back to
+        the spinner. If pending_users is empty (spinner timed out), goes back to
+        add_recipient. Otherwise advances to name_recipient for the chosen account.
         """
-        errors = {}
         pending = self._get_pending_users()
 
         if user_input is not None:
@@ -385,9 +387,55 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
 
             if user_id == CLEAR_PENDING:
                 pending.clear()
+                # Persist the wipe so cleared accounts do not reappear after a restart.
+                self._persist()
                 self._poll_task = None
                 return await self.async_step_add_recipient()
 
+            self._selected_uid = user_id
+            return await self.async_step_name_recipient()
+
+        if not pending:
+            self._poll_task = None
+            return await self.async_step_add_recipient()
+
+        options = [
+            SelectOptionDict(value=uid, label=display)
+            for uid, display in pending.items()
+        ]
+        options.append(SelectOptionDict(value=CLEAR_PENDING, label=CLEAR_PENDING_LABEL))
+        return self.async_show_form(
+            step_id="select_recipient",
+            data_schema=vol.Schema({
+                vol.Required(CONF_USER_ID): SelectSelector(
+                    SelectSelectorConfig(
+                        options=options,
+                        translation_key="pending_user",
+                    )
+                ),
+            }),
+        )
+
+    async def async_step_name_recipient(self, user_input=None) -> FlowResult:
+        """Name the selected account and optionally add another.
+
+        Shows two name fields: recipient_name (ASCII only, used for entity ID
+        slugification) and friendly_name (any characters including emoji and
+        unicode, used as the HA display name). Both are suggested from the LINE
+        display name of the account chosen in select_recipient. The recipient
+        type (user or group) is detected from the LINE ID prefix (U vs C).
+        """
+        pending = self._get_pending_users()
+        user_id = self._selected_uid
+        if user_id is None or user_id not in pending:
+            # Selection vanished (e.g. cleared elsewhere); start over.
+            self._selected_uid = None
+            return await self.async_step_select_recipient()
+
+        line_display_name = pending.get(user_id, user_id)
+        errors = {}
+
+        if user_input is not None:
             name = user_input.get(CONF_RECIPIENT_NAME, "").strip()
             friendly_name = user_input.get(CONF_FRIENDLY_NAME, "").strip()
             add_another = user_input.get(CONF_ADD_ANOTHER, False)
@@ -401,7 +449,6 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             elif any(r["user_id"] == user_id for r in self._recipients.values()):
                 errors["base"] = "duplicate_user_id"
             else:
-                line_display_name = pending.get(user_id, user_id)
                 self._recipients[name] = {
                     "user_id": user_id,
                     "display_name": line_display_name,
@@ -409,35 +456,23 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
                     "type": "group" if user_id.startswith("C") else "user",
                 }
                 pending.pop(user_id, None)
+                self._selected_uid = None
                 self._persist()
                 if add_another:
                     self._poll_task = None
                     return await self.async_step_add_recipient()
                 return self._save()
 
-        if not pending:
-            self._poll_task = None
-            return await self.async_step_add_recipient()
-
-        options = [
-            SelectOptionDict(value=uid, label=display)
-            for uid, display in pending.items()
-        ]
-        options.append(SelectOptionDict(value=CLEAR_PENDING, label=CLEAR_PENDING_LABEL))
-        first_uid = next(iter(pending))
-        first_line_name = pending[first_uid]
-        first_entity_name = _sanitize_name(first_line_name)
+        suggested_name = _sanitize_name(line_display_name)
         return self.async_show_form(
-            step_id="select_recipient",
+            step_id="name_recipient",
             data_schema=vol.Schema({
-                vol.Required(CONF_USER_ID): SelectSelector(
-                    SelectSelectorConfig(options=options)
-                ),
-                vol.Optional(CONF_FRIENDLY_NAME, default=first_line_name): str,
-                vol.Optional(CONF_RECIPIENT_NAME, default=first_entity_name): str,
+                vol.Optional(CONF_FRIENDLY_NAME, default=line_display_name): str,
+                vol.Optional(CONF_RECIPIENT_NAME, default=suggested_name): str,
                 vol.Optional(CONF_ADD_ANOTHER, default=False): bool,
             }),
             errors=errors,
+            description_placeholders={"line_name": line_display_name},
         )
 
     async def async_step_remove_recipient(self, user_input=None) -> FlowResult:
@@ -445,7 +480,6 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
         if not self._recipients:
             return self.async_abort(reason="no_recipients")
 
-        errors = {}
         if user_input is not None:
             name = user_input[CONF_RECIPIENT_NAME]
             self._recipients.pop(name, None)
@@ -460,7 +494,6 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema({
                 vol.Required(CONF_RECIPIENT_NAME): vol.In(remove_options),
             }),
-            errors=errors,
         )
 
     async def async_step_rotate_token(self, user_input=None) -> FlowResult:
@@ -500,35 +533,38 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
         )
 
     def _get_pending_users(self) -> dict:
-        """Return the in-memory pending_users dict for the current config entry.
+        """Return the live pending_users dict from the entry's runtime data.
 
-        Looks up the live dict in hass.data, which is the authoritative source
-        during normal operation. The dict is pre-populated from config entry data
-        at startup so captures survive HA restarts.
+        The runtime dict is the authoritative source during normal operation.
+        It is pre-populated from config entry data at startup so captures
+        survive HA restarts. Returns an empty dict if the entry is not loaded.
         """
-        entry_data = self.hass.data.get(DOMAIN, {})
-        for key, val in entry_data.items():
-            if isinstance(val, dict) and PENDING_USERS_KEY in val:
-                return val[PENDING_USERS_KEY]
-        return {}
+        runtime = getattr(self.config_entry, "runtime_data", None)
+        return getattr(runtime, "pending_users", None) or {}
+
+    def _get_pending_event(self) -> asyncio.Event | None:
+        """Return the runtime pending_event set by the webhook on capture."""
+        runtime = getattr(self.config_entry, "runtime_data", None)
+        return getattr(runtime, "pending_event", None)
 
     def _persist(self) -> None:
         """Write current recipients and credentials to the config entry without closing the flow.
 
-        Called after each recipient is confirmed so partial progress is not lost
-        if the user cancels the flow before finishing. Also writes the current
-        in-memory pending_users back to the config entry so the update listener
-        can detect that only pending_users changed and skip the reload.
+        Called after each recipient is confirmed (or pending is cleared) so
+        partial progress is not lost if the user cancels the flow. Preserves
+        any other keys already in entry data, and writes the current in-memory
+        pending_users back so the update listener can detect pending-only
+        writes and skip the reload.
         """
-        pending = self._get_pending_users()
-        new_data = {
+        new_data = dict(self.config_entry.data)
+        new_data.update({
             CONF_CHANNEL_ACCESS_TOKEN: self._token,
             CONF_CHANNEL_SECRET: self._secret,
             RECIPIENTS_KEY: self._recipients,
-            PENDING_USERS_KEY: dict(pending),
-        }
+            PENDING_USERS_KEY: dict(self._get_pending_users()),
+        })
         self.hass.config_entries.async_update_entry(
-            self._config_entry, data=new_data
+            self.config_entry, data=new_data
         )
 
     def _save(self) -> FlowResult:

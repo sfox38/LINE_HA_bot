@@ -20,9 +20,16 @@ LINE_GROUP_SUMMARY_URL = "https://api.line.me/v2/bot/group/{group_id}/summary"
 # Path at which HA exposes the permanent webhook to LINE
 LINE_WEBHOOK_PATH = "/api/line_ha_bot/webhook"
 
-# hass.data[DOMAIN] keys
+# Config entry data keys
 RECIPIENTS_KEY = "recipients"        # Dict mapping HA name -> recipient details dict, stored in config entry
-PENDING_USERS_KEY = "pending_users"  # Temporary dict of user IDs captured by the webhook, not yet confirmed
+PENDING_USERS_KEY = "pending_users"  # LINE IDs captured by the webhook, not yet confirmed as recipients.
+                                     # Mirrored into config entry data so captures survive restarts.
+
+# Maximum number of pending (uncaptured) senders kept; the oldest is evicted beyond this.
+MAX_PENDING_USERS = 20
+
+# Reply token value LINE uses for its internal webhook test events
+LINE_TEST_REPLY_TOKEN = "00000000000000000000000000000000"
 
 # line_ha_bot.send_message service data attributes (optional, passed under the 'data' key)
 ATTR_IMAGE_URL = "image_url"                # URL of an image to send after the text message
@@ -51,14 +58,13 @@ EVENT_SEND_FAILED = "line_bot_send_failed"            # Fired when a send fails
 
 # Sentinel value for the options flow select_recipient dropdown
 CLEAR_PENDING = "__clear__"          # Sentinel: discard all captured pending users
-CLEAR_PENDING_LABEL = "Clear all pending"  # Display label for the CLEAR_PENDING sentinel option
+CLEAR_PENDING_LABEL = "Clear all pending"  # Fallback label; translated via the pending_user selector key
 
 # Custom service name
 SERVICE_SEND_MESSAGE = "send_message"
 
 # hass.data[DOMAIN] runtime keys (not stored in config entry)
 KEY_VIEW_REGISTERED = "view_registered"   # Prevents double-registering the webhook view
-KEY_CONFIG_SNAPSHOT = "config_snapshot"   # Snapshot of reload-relevant config keys
 
 # Default strings used in message building
 DEFAULT_FLEX_ALT_TEXT = "LINE message"    # Fallback text for flex/template messages when none provided
