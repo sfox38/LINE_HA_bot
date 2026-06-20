@@ -19,16 +19,17 @@ Example automation action:
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.components.notify import NotifyEntity, NotifyEntityFeature
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import slugify
 
+from . import LineBotConfigEntry
 from .api import async_send_line_message
 from .const import (
     DOMAIN,
@@ -42,8 +43,8 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: LineBotConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up LINE Bot notify entities from a config entry.
 
@@ -74,7 +75,7 @@ async def async_setup_entry(
 
     entities = [
         LineMessagingNotifyEntity(
-            hass, entry, name, r.get("friendly_name", name), r["user_id"], token
+            entry, name, r.get("friendly_name", name), r["user_id"], token
         )
         for name, r in recipients.items()
     ]
@@ -101,15 +102,13 @@ class LineMessagingNotifyEntity(NotifyEntity):
 
     def __init__(
         self,
-        hass: HomeAssistant,
-        entry: ConfigEntry,
+        entry: LineBotConfigEntry,
         recipient_name: str,
         friendly_name: str,
         user_id: str,
         token: str,
     ) -> None:
         """Initialise the notify entity."""
-        self.hass = hass
         self._recipient_name = recipient_name
         self._user_id = user_id
         self._token = token
@@ -130,7 +129,7 @@ class LineMessagingNotifyEntity(NotifyEntity):
         self,
         message: str,
         title: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Send a plain text message to this LINE recipient via the Push API.
 

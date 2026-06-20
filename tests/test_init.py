@@ -13,8 +13,10 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.setup import async_setup_component
 
+from custom_components.line_ha_bot import _pending_store
 from custom_components.line_ha_bot.const import (
     CONF_CHANNEL_ACCESS_TOKEN,
+    CONF_CHANNEL_SECRET,
     DOMAIN,
     LINE_PUSH_URL,
     LINE_REPLY_URL,
@@ -23,7 +25,7 @@ from custom_components.line_ha_bot.const import (
     SERVICE_SEND_MESSAGE,
 )
 
-from .conftest import GROUP_ID, USER_ID
+from .conftest import GROUP_ID, USER_ID, mock_quota_endpoints
 
 
 def calls_to(aioclient_mock: AiohttpClientMocker, url: str) -> list:
@@ -213,21 +215,6 @@ async def test_service_rejects_invalid_button_count(
 # --- update listener -------------------------------------------------------
 
 
-async def test_update_listener_skips_reload_on_pending_only_change(
-    hass: HomeAssistant, init_integration: MockConfigEntry
-) -> None:
-    """A pending_users-only write does not trigger a reload."""
-    with patch.object(
-        hass.config_entries, "async_reload", new=AsyncMock()
-    ) as mock_reload:
-        new_data = dict(init_integration.data)
-        new_data[PENDING_USERS_KEY] = {"Uxyz": "Someone"}
-        hass.config_entries.async_update_entry(init_integration, data=new_data)
-        await hass.async_block_till_done()
-
-    mock_reload.assert_not_called()
-
-
 async def test_update_listener_reloads_on_credential_change(
     hass: HomeAssistant, init_integration: MockConfigEntry
 ) -> None:
@@ -258,3 +245,47 @@ async def test_update_listener_reloads_on_recipient_change(
         await hass.async_block_till_done()
 
     mock_reload.assert_called_once()
+
+
+# --- pending captures Store ------------------------------------------------
+
+
+async def test_setup_migrates_legacy_pending_from_entry_data(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Captures persisted by an older version (in entry data) move to the Store."""
+    legacy_id = "U" + "e" * 32
+    mock_quota_endpoints(aioclient_mock)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_CHANNEL_ACCESS_TOKEN: "tok",
+            CONF_CHANNEL_SECRET: "sec",
+            RECIPIENTS_KEY: {},
+            PENDING_USERS_KEY: {legacy_id: "Legacy"},
+        },
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Loaded into runtime and the Store, and stripped from entry data.
+    assert entry.runtime_data.pending_users[legacy_id] == "Legacy"
+    assert PENDING_USERS_KEY not in entry.data
+    stored = await entry.runtime_data.store.async_load()
+    assert stored[legacy_id] == "Legacy"
+
+
+async def test_remove_entry_deletes_pending_store(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Removing the config entry deletes its pending-captures Store file."""
+    store = init_integration.runtime_data.store
+    await store.async_save({"Uxyz": "Someone"})
+    assert await store.async_load() == {"Uxyz": "Someone"}
+
+    assert await hass.config_entries.async_remove(init_integration.entry_id)
+    await hass.async_block_till_done()
+
+    # A fresh handle on the same key finds nothing - the file was removed.
+    assert await _pending_store(hass, init_integration).async_load() is None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import patch
 
 import aiohttp
@@ -18,6 +19,7 @@ from homeassistant.helpers import network
 
 from custom_components.line_ha_bot.config_flow import (
     CONF_ADD_ANOTHER,
+    LineMessagingOptionsFlow,
     _get_external_url,
     _is_emoji,
     _is_valid_name,
@@ -32,13 +34,15 @@ from custom_components.line_ha_bot.const import (
     CONF_RECIPIENT_NAME,
     CONF_USER_ID,
     DOMAIN,
+    KEY_PENDING_EVENT,
     LINE_TOKEN_VERIFY_URL,
     RECIPIENTS_KEY,
 )
 
-from .conftest import mock_quota_endpoints
+from .conftest import USER_ID, mock_quota_endpoints
 
 UNKNOWN_USER = "U" + "b" * 32
+UNKNOWN_USER_2 = "U" + "c" * 32
 UNKNOWN_GROUP = "C" + "b" * 32
 
 EXTERNAL_URL_PATH = "custom_components.line_ha_bot.config_flow._get_external_url"
@@ -344,10 +348,148 @@ async def test_options_name_recipient_rejects_duplicate(
     assert result["errors"][CONF_RECIPIENT_NAME] == "duplicate_name"
 
 
+async def test_options_name_recipient_rejects_empty_name(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """An empty (whitespace-only) recipient name is rejected."""
+    init_integration.runtime_data.pending_users[UNKNOWN_USER] = "Stranger"
+
+    result = await hass.config_entries.options.async_init(
+        init_integration.entry_id
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "add_recipient"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_USER_ID: UNKNOWN_USER}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_RECIPIENT_NAME: "   "}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"][CONF_RECIPIENT_NAME] == "name_required"
+
+
+async def test_options_name_recipient_rejects_duplicate_user_id(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """A captured id that is already a recipient is rejected on naming."""
+    # USER_ID already belongs to the "david" recipient from the fixture.
+    init_integration.runtime_data.pending_users[USER_ID] = "David again"
+
+    result = await hass.config_entries.options.async_init(
+        init_integration.entry_id
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "add_recipient"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_USER_ID: USER_ID}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_RECIPIENT_NAME: "dave2"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"]["base"] == "duplicate_user_id"
+
+
+async def test_options_add_another_loops_back_and_saves_both(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Ticking 'add another' saves the first recipient and returns for the second."""
+    init_integration.runtime_data.pending_users[UNKNOWN_USER] = "Stranger"
+    init_integration.runtime_data.pending_users[UNKNOWN_USER_2] = "Newcomer"
+
+    result = await hass.config_entries.options.async_init(
+        init_integration.entry_id
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "add_recipient"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_USER_ID: UNKNOWN_USER}
+    )
+    # Name the first one and ask to add another.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_RECIPIENT_NAME: "stranger", CONF_ADD_ANOTHER: True},
+    )
+    await hass.async_block_till_done()
+    # Loops straight back to the select form because a second capture is pending.
+    assert result["step_id"] == "select_recipient"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_USER_ID: UNKNOWN_USER_2}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_RECIPIENT_NAME: "newcomer", CONF_ADD_ANOTHER: False},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    recipients = init_integration.data[RECIPIENTS_KEY]
+    assert "stranger" in recipients
+    assert "newcomer" in recipients
+
+
+async def test_options_add_recipient_waits_then_advances_on_capture(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """With nothing pending the spinner waits, and a capture wakes it via the event."""
+    result = await hass.config_entries.options.async_init(
+        init_integration.entry_id
+    )
+    # No pending captures yet -> the spinner is shown.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "add_recipient"}
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+
+    # The webhook would populate pending and set the shared event.
+    init_integration.runtime_data.pending_users[UNKNOWN_USER] = "Stranger"
+    hass.data[DOMAIN][KEY_PENDING_EVENT].set()
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_configure(result["flow_id"])
+    assert result["step_id"] == "select_recipient"
+
+    # Complete the flow so no wait task lingers.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_USER_ID: UNKNOWN_USER}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_RECIPIENT_NAME: "stranger", CONF_ADD_ANOTHER: False}
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_wait_for_pending_gives_up_after_timeout(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """_wait_for_pending returns (does not hang) once the timeout elapses."""
+    flow = LineMessagingOptionsFlow()
+    flow.hass = hass
+
+    with (
+        patch.object(flow, "_get_pending_users", return_value={}),
+        patch("custom_components.line_ha_bot.config_flow._WAIT_TIMEOUT", 0.05),
+    ):
+        # A small positive timeout exercises the real wait-then-give-up path.
+        # Wrapped in wait_for so a regression that hangs fails fast instead of stalling.
+        await asyncio.wait_for(flow._wait_for_pending(), timeout=5)
+
+
 async def test_options_select_clear_pending(
     hass: HomeAssistant, init_integration: MockConfigEntry
 ) -> None:
-    """Selecting the clear sentinel wipes pending and returns to the spinner."""
+    """Selecting the clear sentinel wipes pending (and the Store) then waits anew.
+
+    Clearing returns to the spinner, so to leave no lingering wait task we then
+    drive the spinner the way the webhook would: a fresh capture wakes it and the
+    flow advances to the select form, which we complete.
+    """
     init_integration.runtime_data.pending_users[UNKNOWN_USER] = "Stranger"
 
     result = await hass.config_entries.options.async_init(
@@ -361,12 +503,28 @@ async def test_options_select_clear_pending(
     )
 
     assert init_integration.runtime_data.pending_users == {}
+    # The cleared captures are wiped from the Store too.
+    assert await init_integration.runtime_data.store.async_load() == {}
     # Back to the waiting spinner since nothing is left to select.
     assert result["type"] is FlowResultType.SHOW_PROGRESS
-    # Remove the flow so its long-running background poll task is cancelled and
-    # does not keep teardown waiting.
-    hass.config_entries.options._async_remove_flow_progress(result["flow_id"])
+
+    # A new capture lands: mimic the webhook populating pending and waking the spinner.
+    init_integration.runtime_data.pending_users[UNKNOWN_USER_2] = "Newcomer"
+    hass.data[DOMAIN][KEY_PENDING_EVENT].set()
     await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_configure(result["flow_id"])
+    assert result["step_id"] == "select_recipient"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_USER_ID: UNKNOWN_USER_2}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_RECIPIENT_NAME: "newcomer", CONF_ADD_ANOTHER: False}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert "newcomer" in init_integration.data[RECIPIENTS_KEY]
 
 
 async def test_options_remove_recipient(
@@ -466,3 +624,21 @@ async def test_options_rotate_token_invalid(
     )
     assert result["type"] is FlowResultType.FORM
     assert result["errors"]["base"] == "invalid_token"
+
+
+async def test_options_rotate_token_empty_secret(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """A blank secret on rotate is rejected before the token is verified."""
+    result = await hass.config_entries.options.async_init(
+        init_integration.entry_id
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "rotate_token"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_CHANNEL_ACCESS_TOKEN: "tok", CONF_CHANNEL_SECRET: "   "},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"][CONF_CHANNEL_SECRET] == "invalid_secret"

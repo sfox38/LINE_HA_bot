@@ -572,6 +572,15 @@ For details, see [LINE Messaging API pricing](https://developers.line.biz/en/doc
 ## Changelog
 
 ### 1.0.3
+
+- **Pending captures moved to a dedicated Store**: Captured-but-unconfirmed senders are now persisted with `homeassistant.helpers.storage.Store` instead of inside the config entry data. They still survive restarts, and any captures saved by an earlier version are migrated automatically on first load. This removes the config-entry write on every webhook capture, along with the snapshot/skip-reload machinery that existed only to compensate for it.
+- **Simplified reload listener**: With pending captures no longer in entry data, the update listener reloads on any credential or recipient change without the previous change-detection snapshot.
+- **Reload-safe options spinner**: The "waiting for message" event now lives in `hass.data`, so it survives a config entry reload. The add-recipient wait was rewritten as a single bounded wait (the old 300-cycle polling fallback is gone) and no longer leaves a background task lingering.
+- **Store cleanup on removal**: Removing the integration now deletes its pending-captures store file via `async_remove_entry`.
+- **Concurrent display-name lookups**: When one webhook request carries several new senders, their LINE display names are fetched concurrently rather than one after another.
+- **Lazy entity-registry lookup**: The webhook only scans the entity registry when an event actually maps to a known recipient.
+- **Modernized typing**: Typed config entry runtime data (`ConfigEntry[LineBotRuntimeData]`), `ConfigFlowResult` flow returns, `AddConfigEntryEntitiesCallback`, and a typed quota coordinator and sensors.
+- **Cleanup**: Removed an unused config-entry type alias and an inert selector translation key, fixed import ordering, and dropped a redundant `hass` reference on the notify entity.
 - **MESA** - Added mesa_profile.json
 
 ### 1.0.2

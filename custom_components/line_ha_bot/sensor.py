@@ -14,22 +14,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from typing import Any
 
 import aiohttp
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
     UpdateFailed,
 )
 
+from . import LineBotConfigEntry
 from .const import (
     DOMAIN,
     CONF_CHANNEL_ACCESS_TOKEN,
@@ -45,8 +46,8 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: LineBotConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up LINE Bot quota sensors from a config entry."""
     coordinator = LineQuotaCoordinator(hass, entry)
@@ -58,10 +59,10 @@ async def async_setup_entry(
     ])
 
 
-class LineQuotaCoordinator(DataUpdateCoordinator):
+class LineQuotaCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator that fetches LINE quota and consumption once per hour."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(self, hass: HomeAssistant, entry: LineBotConfigEntry) -> None:
         super().__init__(
             hass,
             _LOGGER,
@@ -71,7 +72,7 @@ class LineQuotaCoordinator(DataUpdateCoordinator):
         )
         self._token = entry.data[CONF_CHANNEL_ACCESS_TOKEN]
 
-    async def _fetch_json(self, url: str, label: str) -> dict:
+    async def _fetch_json(self, url: str, label: str) -> dict[str, Any]:
         """GET one LINE API endpoint, raising UpdateFailed on a non-200 status."""
         session = async_get_clientsession(self.hass)
         headers = {"Authorization": f"Bearer {self._token}"}
@@ -80,7 +81,7 @@ class LineQuotaCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed(f"LINE {label} API returned HTTP {resp.status}")
             return await resp.json()
 
-    async def _async_update_data(self) -> dict:
+    async def _async_update_data(self) -> dict[str, Any]:
         """Fetch quota and consumption from the LINE API in parallel."""
         try:
             quota_data, consumption_data = await asyncio.gather(
@@ -98,7 +99,7 @@ class LineQuotaCoordinator(DataUpdateCoordinator):
         }
 
 
-class LineQuotaLimitSensor(CoordinatorEntity, SensorEntity):
+class LineQuotaLimitSensor(CoordinatorEntity[LineQuotaCoordinator], SensorEntity):
     """Sensor showing the monthly message limit for the LINE channel."""
 
     _attr_icon = "mdi:message-badge-outline"
@@ -106,7 +107,9 @@ class LineQuotaLimitSensor(CoordinatorEntity, SensorEntity):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def __init__(self, coordinator: LineQuotaCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: LineQuotaCoordinator, entry: LineBotConfigEntry
+    ) -> None:
         super().__init__(coordinator)
         self._attr_name = "Monthly message limit"
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_quota_limit"
@@ -124,13 +127,13 @@ class LineQuotaLimitSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.data.get("limit")
 
     @property
-    def extra_state_attributes(self) -> dict:
+    def extra_state_attributes(self) -> dict[str, Any]:
         if self.coordinator.data is None:
             return {}
         return {"plan_type": self.coordinator.data.get("type")}
 
 
-class LineQuotaConsumptionSensor(CoordinatorEntity, SensorEntity):
+class LineQuotaConsumptionSensor(CoordinatorEntity[LineQuotaCoordinator], SensorEntity):
     """Sensor showing messages sent so far this month."""
 
     _attr_icon = "mdi:message-text-clock-outline"
@@ -139,7 +142,9 @@ class LineQuotaConsumptionSensor(CoordinatorEntity, SensorEntity):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def __init__(self, coordinator: LineQuotaCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: LineQuotaCoordinator, entry: LineBotConfigEntry
+    ) -> None:
         super().__init__(coordinator)
         self._attr_name = "Monthly message consumption"
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_quota_consumption"
@@ -157,7 +162,7 @@ class LineQuotaConsumptionSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.data.get("consumption")
 
     @property
-    def extra_state_attributes(self) -> dict:
+    def extra_state_attributes(self) -> dict[str, Any]:
         if self.coordinator.data is None:
             return {}
         limit = self.coordinator.data.get("limit")

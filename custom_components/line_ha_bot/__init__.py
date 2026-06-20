@@ -57,7 +57,7 @@ import hashlib
 import hmac
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import voluptuous as vol
 from aiohttp.web import Request, Response
@@ -69,6 +69,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .api import async_get_group_name, async_get_profile_name, async_send_line_message
@@ -105,7 +106,9 @@ from .const import (
     RECIPIENTS_KEY,
     EVENT_MESSAGE_RECEIVED,
     SERVICE_SEND_MESSAGE,
+    KEY_PENDING_EVENT,
     KEY_VIEW_REGISTERED,
+    STORAGE_VERSION,
     DEFAULT_FLEX_ALT_TEXT,
     DEFAULT_LOCATION_TITLE,
     DEFAULT_ACTION_LABEL,
@@ -167,22 +170,33 @@ SEND_MESSAGE_SCHEMA = vol.Schema(
 class LineBotRuntimeData:
     """Per-entry runtime state stored on entry.runtime_data.
 
-    pending_users mirrors the PENDING_USERS_KEY dict in config entry data;
-    the webhook mutates this live dict and persists it in batched writes.
-    pending_event wakes the options flow spinner as soon as a capture lands.
+    pending_users holds LINE IDs captured by the webhook but not yet confirmed
+    as recipients. It is the live working copy; the authoritative persisted copy
+    lives in a Store (see _pending_store) so captures survive restarts without
+    churning config entry data. The webhook mutates this dict and saves it.
     """
 
     pending_users: dict[str, str]
-    config_snapshot: dict
-    pending_event: asyncio.Event = field(default_factory=asyncio.Event)
+    store: Store
 
 
-LineBotConfigEntry = ConfigEntry  # runtime_data holds LineBotRuntimeData
+type LineBotConfigEntry = ConfigEntry[LineBotRuntimeData]
+
+
+def _pending_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
+    """Return the Store that persists this entry's pending captures."""
+    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.pending")
 
 
 def _async_register_webhook(hass: HomeAssistant) -> None:
-    """Register the permanent webhook view exactly once per HA run."""
+    """Register the permanent webhook view exactly once per HA run.
+
+    Also creates the shared pending_event in hass.data. The event lives here
+    rather than on entry.runtime_data so it survives config entry reloads: a
+    task awaiting it (the options flow spinner) keeps working across a reload.
+    """
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault(KEY_PENDING_EVENT, asyncio.Event())
     if not hass.data[DOMAIN].get(KEY_VIEW_REGISTERED):
         hass.http.register_view(LineMessagingWebhookView(hass))
         hass.data[DOMAIN][KEY_VIEW_REGISTERED] = True
@@ -211,37 +225,41 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: LineBotConfigEntry) -> bool:
     """Set up LINE Bot from a config entry.
 
     Called once per config entry on HA startup (or after a reload). Registers
     the webhook view if not already registered (defensive, in case async_setup
-    was not called), initialises runtime data (loading any persisted
-    pending_users from config entry data), sets up the notify and sensor
-    platforms, and registers an update listener to reload on options changes.
+    was not called), loads persisted pending captures from the Store, sets up
+    the notify and sensor platforms, and registers an update listener to reload
+    on options changes.
     """
     _async_register_webhook(hass)
 
-    # pending_users holds LINE user and group IDs captured by the webhook that
-    # have not yet been confirmed as recipients. Loaded from config entry data
-    # so captures survive HA restarts. config_snapshot is used by the update
-    # listener to detect whether a reload is actually needed (vs a
-    # pending_users-only write).
-    entry.runtime_data = LineBotRuntimeData(
-        pending_users=dict(entry.data.get(PENDING_USERS_KEY, {})),
-        config_snapshot={
-            CONF_CHANNEL_ACCESS_TOKEN: entry.data.get(CONF_CHANNEL_ACCESS_TOKEN),
-            CONF_CHANNEL_SECRET: entry.data.get(CONF_CHANNEL_SECRET),
-            RECIPIENTS_KEY: dict(entry.data.get(RECIPIENTS_KEY, {})),
-        },
-    )
+    store = _pending_store(hass, entry)
+    pending: dict[str, str] = await store.async_load() or {}
+
+    # One-time migration: older versions persisted pending captures inside the
+    # config entry data. Move any such captures into the Store and strip the key
+    # from entry data. Done before the update listener is registered so the
+    # entry write does not trigger a reload.
+    legacy = entry.data.get(PENDING_USERS_KEY)
+    if legacy:
+        pending = {**legacy, **pending}
+        await store.async_save(pending)
+        hass.config_entries.async_update_entry(
+            entry,
+            data={k: v for k, v in entry.data.items() if k != PENDING_USERS_KEY},
+        )
+
+    entry.runtime_data = LineBotRuntimeData(pending_users=pending, store=store)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_update_listener))
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: LineBotConfigEntry) -> bool:
     """Unload a LINE Bot config entry.
 
     Tears down the notify and sensor platforms. The webhook view and the
@@ -252,23 +270,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
-async def async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when credentials or recipients change.
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the pending-captures Store when the entry is removed."""
+    await _pending_store(hass, entry).async_remove()
 
-    Triggered whenever the config entry data is changed. Compares the new entry
-    data against the snapshot taken at setup time. If only pending_users changed,
-    skips the reload since pending_users does not affect platforms or the service.
-    A full reload is only triggered when the token, secret, or recipients change.
+
+async def async_update_listener(hass: HomeAssistant, entry: LineBotConfigEntry) -> None:
+    """Reload the entry when its data changes.
+
+    Only credentials and recipients live in entry data now (pending captures
+    are kept in the Store), so any change here warrants recreating the notify
+    entities and re-reading credentials.
     """
-    runtime = getattr(entry, "runtime_data", None)
-    snapshot = runtime.config_snapshot if runtime else {}
-    if (
-        entry.data.get(CONF_CHANNEL_ACCESS_TOKEN) == snapshot.get(CONF_CHANNEL_ACCESS_TOKEN)
-        and entry.data.get(CONF_CHANNEL_SECRET) == snapshot.get(CONF_CHANNEL_SECRET)
-        and entry.data.get(RECIPIENTS_KEY) == snapshot.get(RECIPIENTS_KEY)
-    ):
-        _LOGGER.debug("LINE Bot: config unchanged (pending_users write only), skipping reload")
-        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -460,6 +473,9 @@ async def _async_send_message_service(hass: HomeAssistant, call: ServiceCall) ->
     for eid in call.data["entity_id"]:
         user_id = eid_to_user_id.get(eid)
         if not user_id:
+            # Unresolvable targets are skipped before the reply token is touched,
+            # so the single-use token is spent on the first target we can
+            # actually deliver to rather than being wasted on a bad entity_id.
             _LOGGER.error(
                 "LINE Bot send_message: could not resolve entity_id %s to a LINE user ID",
                 eid,
@@ -594,17 +610,32 @@ class LineMessagingWebhookView(HomeAssistantView):
             r["user_id"]: {"name": name, "display_name": r.get("display_name", "")}
             for name, r in recipients.items()
         }
-        registry = er.async_get(self.hass)
-        prefix = f"{DOMAIN}_"
-        user_id_to_entity_id = {
-            e.unique_id[len(prefix):]: e.entity_id
-            for e in er.async_entries_for_config_entry(registry, entry.entry_id)
-            if e.domain == Platform.NOTIFY
-            and e.unique_id
-            and e.unique_id.startswith(prefix)
-        }
 
-        captured = False
+        # Resolve a LINE id to its notify entity_id, scanning the entity registry
+        # only on first need so webhooks that carry no known-recipient events (or
+        # only captures) never touch the registry.
+        prefix = f"{DOMAIN}_"
+        entity_map: dict[str, str] | None = None
+
+        def entity_id_for(line_id: str) -> str | None:
+            nonlocal entity_map
+            if entity_map is None:
+                registry = er.async_get(self.hass)
+                entity_map = {
+                    e.unique_id[len(prefix):]: e.entity_id
+                    for e in er.async_entries_for_config_entry(
+                        registry, entry.entry_id
+                    )
+                    if e.domain == Platform.NOTIFY
+                    and e.unique_id
+                    and e.unique_id.startswith(prefix)
+                }
+            return entity_map.get(line_id)
+
+        # LINE ids seen this request that are unknown and not yet pending, mapped
+        # to their source type. Display-name lookups are gathered after the loop
+        # so multiple new senders in one batch resolve concurrently.
+        unknown: dict[str, str] = {}
         for event in events:
             if event.get("replyToken") == LINE_TEST_REPLY_TOKEN:
                 _LOGGER.debug("LINE Bot webhook: skipping test event")
@@ -656,7 +687,7 @@ class LineMessagingWebhookView(HomeAssistantView):
                             "type": msg_type,
                             "user_id": user_id,
                             "group_id": group_id,
-                            "entity_id": user_id_to_entity_id.get(lookup_id),
+                            "entity_id": entity_id_for(lookup_id),
                             "recipient_name": recipient["name"],
                             "display_name": recipient["display_name"],
                             "message_text": msg.get("text") if msg_type == "text" else None,
@@ -679,7 +710,7 @@ class LineMessagingWebhookView(HomeAssistantView):
                             "type": "postback",
                             "user_id": user_id,
                             "group_id": group_id,
-                            "entity_id": user_id_to_entity_id.get(lookup_id),
+                            "entity_id": entity_id_for(lookup_id),
                             "recipient_name": recipient["name"],
                             "display_name": recipient["display_name"],
                             "message_text": None,
@@ -702,40 +733,41 @@ class LineMessagingWebhookView(HomeAssistantView):
                     )
                 continue
 
-            if lookup_id in pending:
+            if lookup_id in pending or lookup_id in unknown:
                 _LOGGER.debug(
-                    "LINE Bot webhook: %s %s already in pending", source_type, lookup_id
+                    "LINE Bot webhook: %s %s already pending", source_type, lookup_id
                 )
                 continue
+            unknown[lookup_id] = source_type
 
-            if source_type == "group":
-                _LOGGER.debug("LINE Bot webhook: capturing group %s", lookup_id)
-                display_name = await async_get_group_name(self.hass, token, lookup_id)
-            else:
-                _LOGGER.debug("LINE Bot webhook: capturing user %s", lookup_id)
-                display_name = await async_get_profile_name(self.hass, token, lookup_id)
-            pending[lookup_id] = display_name or lookup_id
-            # Cap pending captures; evict the oldest beyond MAX_PENDING_USERS.
-            while len(pending) > MAX_PENDING_USERS:
-                evicted = next(iter(pending))
-                pending.pop(evicted)
-                _LOGGER.debug("LINE Bot webhook: evicted oldest pending %s", evicted)
-            runtime.pending_event.set()
-            captured = True
-            _LOGGER.debug(
-                "LINE Bot webhook: captured %s %s (%s)",
-                source_type,
-                lookup_id,
-                pending[lookup_id],
+        if unknown:
+            # Resolve display names concurrently, then apply in arrival order so
+            # the oldest-eviction policy is preserved.
+            names = await asyncio.gather(
+                *(
+                    async_get_group_name(self.hass, token, line_id)
+                    if source_type == "group"
+                    else async_get_profile_name(self.hass, token, line_id)
+                    for line_id, source_type in unknown.items()
+                )
             )
-
-        if captured:
-            # Persist pending_users to config entry data in one write per request
-            # so captures survive HA restarts. This writes only pending_users;
-            # the update listener detects this and skips the reload.
-            new_data = dict(entry.data)
-            new_data[PENDING_USERS_KEY] = dict(pending)
-            self.hass.config_entries.async_update_entry(entry, data=new_data)
+            for (lookup_id, source_type), display_name in zip(unknown.items(), names):
+                pending[lookup_id] = display_name or lookup_id
+                # Cap pending captures; evict the oldest beyond MAX_PENDING_USERS.
+                while len(pending) > MAX_PENDING_USERS:
+                    evicted = next(iter(pending))
+                    pending.pop(evicted)
+                    _LOGGER.debug("LINE Bot webhook: evicted oldest pending %s", evicted)
+                _LOGGER.debug(
+                    "LINE Bot webhook: captured %s %s (%s)",
+                    source_type,
+                    lookup_id,
+                    pending[lookup_id],
+                )
+            # Wake the options flow spinner and persist captures to the Store
+            # (one write per request) so they survive HA restarts.
+            self.hass.data[DOMAIN][KEY_PENDING_EVENT].set()
+            await runtime.store.async_save(dict(pending))
 
         return Response(text="OK", status=200)
 

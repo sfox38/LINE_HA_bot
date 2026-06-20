@@ -65,6 +65,12 @@ SERVICE_SEND_MESSAGE = "send_message"
 
 # hass.data[DOMAIN] runtime keys (not stored in config entry)
 KEY_VIEW_REGISTERED = "view_registered"   # Prevents double-registering the webhook view
+KEY_PENDING_EVENT = "pending_event"       # asyncio.Event the webhook sets on each new capture;
+                                          # held in hass.data so it survives config entry reloads.
+
+# Persistent store for captured-but-unconfirmed senders. Kept out of config entry
+# data so webhook captures do not churn the entry (and trigger reloads).
+STORAGE_VERSION = 1
 
 # Default strings used in message building
 DEFAULT_FLEX_ALT_TEXT = "LINE message"    # Fallback text for flex/template messages when none provided

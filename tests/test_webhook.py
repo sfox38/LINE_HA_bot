@@ -22,7 +22,6 @@ from custom_components.line_ha_bot.const import (
     LINE_TEST_REPLY_TOKEN,
     LINE_WEBHOOK_PATH,
     MAX_PENDING_USERS,
-    PENDING_USERS_KEY,
 )
 
 from .conftest import (
@@ -307,8 +306,9 @@ async def test_unknown_user_captured_to_pending(
     assert events == []  # capture does not fire a message event
     pending = init_integration.runtime_data.pending_users
     assert pending[UNKNOWN_USER] == "Stranger"
-    # The capture is persisted to config entry data.
-    assert UNKNOWN_USER in init_integration.data[PENDING_USERS_KEY]
+    # The capture is persisted to the Store (not to config entry data).
+    stored = await init_integration.runtime_data.store.async_load()
+    assert stored[UNKNOWN_USER] == "Stranger"
 
 
 async def test_pending_cap_evicts_oldest(
@@ -485,3 +485,48 @@ async def test_unknown_group_captured(
 
     assert resp.status == 200
     assert init_integration.runtime_data.pending_users[UNKNOWN_GROUP] == "Book Club"
+
+
+async def test_multiple_unknown_senders_captured_in_one_request(
+    hass: HomeAssistant,
+    client,
+    init_integration: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """Several new senders in one batch are all captured (names fetched together)."""
+    other_user = "U" + "b" * 32
+    aioclient_mock.get(
+        LINE_PROFILE_URL.format(user_id=UNKNOWN_USER), json={"displayName": "First"}
+    )
+    aioclient_mock.get(
+        LINE_PROFILE_URL.format(user_id=other_user), json={"displayName": "Second"}
+    )
+    body = webhook_body(
+        [
+            {
+                "type": "message",
+                "replyToken": "rt",
+                "source": {"type": "user", "userId": UNKNOWN_USER},
+                "timestamp": 1700000000000,
+                "message": {"type": "text", "id": "1", "text": "hi"},
+            },
+            {
+                "type": "message",
+                "replyToken": "rt",
+                "source": {"type": "user", "userId": other_user},
+                "timestamp": 1700000000000,
+                "message": {"type": "text", "id": "2", "text": "yo"},
+            },
+        ]
+    )
+    resp = await post(client, body)
+    await hass.async_block_till_done()
+
+    assert resp.status == 200
+    pending = init_integration.runtime_data.pending_users
+    assert pending[UNKNOWN_USER] == "First"
+    assert pending[other_user] == "Second"
+    # Both captures are persisted to the Store in a single write.
+    stored = await init_integration.runtime_data.store.async_load()
+    assert stored[UNKNOWN_USER] == "First"
+    assert stored[other_user] == "Second"

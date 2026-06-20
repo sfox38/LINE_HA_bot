@@ -36,23 +36,22 @@ Recipient name rules:
 
 Webhook-based capture:
   The permanent webhook in __init__.py captures LINE user IDs and group IDs into
-  the per-entry runtime pending_users dict whenever someone messages the bot or
-  sends a message in a registered group. The options flow waits on the runtime
-  pending_event (with a polling fallback) and automatically advances to the
-  select step when a user or group appears.
+  the per-entry runtime pending_users dict (persisted to a Store) whenever someone
+  messages the bot or sends a message in a registered group. The options flow
+  waits on the shared pending_event and automatically advances to the select step
+  when a user or group appears.
 """
 
 import asyncio
 import re
 import unicodedata
 
-from homeassistant.util import slugify
 import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import network
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
@@ -60,6 +59,7 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
 )
+from homeassistant.util import slugify
 
 from .const import (
     DOMAIN,
@@ -68,9 +68,9 @@ from .const import (
     CONF_RECIPIENT_NAME,
     CONF_FRIENDLY_NAME,
     CONF_USER_ID,
+    KEY_PENDING_EVENT,
     LINE_TOKEN_VERIFY_URL,
     LINE_WEBHOOK_PATH,
-    PENDING_USERS_KEY,
     CLEAR_PENDING,
     CLEAR_PENDING_LABEL,
     RECIPIENTS_KEY,
@@ -78,11 +78,10 @@ from .const import (
 
 CONF_ADD_ANOTHER = "add_another"
 
-# Polling fallback: checks every _POLL_INTERVAL seconds for up to
-# _POLL_ITERATIONS cycles. Total wait time: 300 * 2 = 600 seconds (10 minutes).
-# The webhook's pending_event normally wakes the wait immediately.
-_POLL_ITERATIONS = 300
-_POLL_INTERVAL = 2
+# Maximum time to wait for an incoming LINE message before the add-recipient
+# spinner gives up and loops back. The webhook's pending_event normally wakes
+# the wait the moment a capture lands; this is just the upper bound.
+_WAIT_TIMEOUT = 600
 
 
 async def _verify_token(hass: HomeAssistant, token: str) -> str | None:
@@ -205,7 +204,7 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._token: str | None = None
         self._secret: str | None = None
 
-    async def async_step_user(self, user_input=None) -> FlowResult:
+    async def async_step_user(self, user_input=None) -> ConfigFlowResult:
         """Step 1: Collect and verify LINE API credentials.
 
         Asks for the Channel Access Token and Channel Secret, both found on the
@@ -236,7 +235,7 @@ class LineMessagingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_webhook_info(self, user_input=None) -> FlowResult:
+    async def async_step_webhook_info(self, user_input=None) -> ConfigFlowResult:
         """Step 2: Show webhook URL and create the config entry on Submit.
 
         Registers the webhook view immediately so LINE's Verify button succeeds
@@ -300,10 +299,10 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
         self._recipients: dict[str, dict] | None = None
         self._token = ""
         self._secret = ""
-        self._poll_task: asyncio.Task | None = None
+        self._wait_task: asyncio.Task | None = None
         self._selected_uid: str | None = None
 
-    async def async_step_init(self, user_input=None) -> FlowResult:
+    async def async_step_init(self, user_input=None) -> ConfigFlowResult:
         """Show the action menu: Add / Remove / Update credentials."""
         if self._recipients is None:
             data = self.config_entry.data
@@ -316,69 +315,72 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             menu_options=["add_recipient", "remove_recipient", "rotate_token"],
         )
 
-    async def async_step_add_recipient(self, user_input=None) -> FlowResult:
+    async def async_step_add_recipient(self, user_input=None) -> ConfigFlowResult:
         """Show spinner waiting for a LINE message, or skip to select if pending exist.
 
-        If pending_users already has entries AND no poll task has been started yet
+        If pending captures already exist AND no wait task has been started yet
         (meaning we are entering fresh, not returning from a progress step), skip
         directly to select_recipient.
 
-        Once a poll task has been started we must always go through the
+        Once a wait task has been started we must always go through the
         async_show_progress / async_show_progress_done transition, because HA
         does not allow a progress step to transition directly to a form step.
-        The poll task itself detects pending_users and returns early, causing
-        async_show_progress_done to fire immediately.
+        The wait task itself returns as soon as a capture lands, causing
+        async_show_progress_done to fire.
         """
         # Fresh entry with pending users already present - skip spinner entirely.
-        if self._poll_task is None and self._get_pending_users():
+        if self._wait_task is None and self._get_pending_users():
             return await self.async_step_select_recipient()
 
-        if self._poll_task is None:
-            self._poll_task = self.hass.async_create_task(
-                self._poll_for_pending_user()
-            )
+        if self._wait_task is None:
+            self._wait_task = self.hass.async_create_task(self._wait_for_pending())
 
-        if not self._poll_task.done():
+        if not self._wait_task.done():
             return self.async_show_progress(
                 step_id="add_recipient",
                 progress_action="waiting_for_message",
-                progress_task=self._poll_task,
+                progress_task=self._wait_task,
             )
 
-        self._poll_task = None
+        self._reset_wait()
         return self.async_show_progress_done(next_step_id="select_recipient")
 
-    async def _poll_for_pending_user(self) -> None:
-        """Background task that waits until a pending user ID appears.
+    def _reset_wait(self) -> None:
+        """Drop the finished wait task so the next entry starts a fresh wait."""
+        self._wait_task = None
 
-        Primarily event-driven: the webhook sets the runtime pending_event as
-        soon as it captures a new sender, which wakes this task immediately.
-        Falls back to checking pending_users every _POLL_INTERVAL seconds (the
-        event object is re-fetched each cycle so a config entry reload mid-wait
-        cannot strand the task). Gives up after _POLL_ITERATIONS cycles; the
-        select step then redirects back to add_recipient for a fresh wait.
+    async def _wait_for_pending(self) -> None:
+        """Wait until a captured sender appears, or until _WAIT_TIMEOUT elapses.
+
+        Event-driven: the webhook sets the shared pending_event (held in
+        hass.data, so it survives config entry reloads) the moment it captures a
+        sender. Clearing the event and then re-checking pending closes the
+        lost-wakeup window, so a single bounded wait is enough - no polling loop.
         """
-        for _ in range(_POLL_ITERATIONS):
-            if self._get_pending_users():
-                return
-            event = self._get_pending_event()
-            if event is None:
-                await asyncio.sleep(_POLL_INTERVAL)
-                continue
+        event = self._get_pending_event()
+        if event is None:
+            return
+        deadline = self.hass.loop.time() + _WAIT_TIMEOUT
+        while not self._get_pending_users():
             event.clear()
+            if self._get_pending_users():  # capture landed during clear()
+                return
+            remaining = deadline - self.hass.loop.time()
+            if remaining <= 0:
+                return
             try:
-                await asyncio.wait_for(event.wait(), timeout=_POLL_INTERVAL)
+                await asyncio.wait_for(event.wait(), timeout=remaining)
             except TimeoutError:
-                pass
+                return
 
-    async def async_step_select_recipient(self, user_input=None) -> FlowResult:
+    async def async_step_select_recipient(self, user_input=None) -> ConfigFlowResult:
         """Pick a captured LINE account or group from the dropdown.
 
         The dropdown lists all pending users and groups plus a "Clear all pending"
-        sentinel (translated via the pending_user selector key). Selecting
-        CLEAR_PENDING wipes pending_users, persists the wipe, and goes back to
-        the spinner. If pending_users is empty (spinner timed out), goes back to
-        add_recipient. Otherwise advances to name_recipient for the chosen account.
+        sentinel. Selecting CLEAR_PENDING wipes the captures, persists the wipe to
+        the Store, and goes back to the spinner. If nothing is pending (spinner
+        timed out), goes back to add_recipient. Otherwise advances to
+        name_recipient for the chosen account.
         """
         pending = self._get_pending_users()
 
@@ -388,15 +390,15 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             if user_id == CLEAR_PENDING:
                 pending.clear()
                 # Persist the wipe so cleared accounts do not reappear after a restart.
-                self._persist()
-                self._poll_task = None
+                await self._save_pending()
+                self._reset_wait()
                 return await self.async_step_add_recipient()
 
             self._selected_uid = user_id
             return await self.async_step_name_recipient()
 
         if not pending:
-            self._poll_task = None
+            self._reset_wait()
             return await self.async_step_add_recipient()
 
         options = [
@@ -408,15 +410,12 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             step_id="select_recipient",
             data_schema=vol.Schema({
                 vol.Required(CONF_USER_ID): SelectSelector(
-                    SelectSelectorConfig(
-                        options=options,
-                        translation_key="pending_user",
-                    )
+                    SelectSelectorConfig(options=options),
                 ),
             }),
         )
 
-    async def async_step_name_recipient(self, user_input=None) -> FlowResult:
+    async def async_step_name_recipient(self, user_input=None) -> ConfigFlowResult:
         """Name the selected account and optionally add another.
 
         Shows two name fields: recipient_name (ASCII only, used for entity ID
@@ -457,9 +456,10 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
                 }
                 pending.pop(user_id, None)
                 self._selected_uid = None
+                await self._save_pending()
                 self._persist()
                 if add_another:
-                    self._poll_task = None
+                    self._reset_wait()
                     return await self.async_step_add_recipient()
                 return self._save()
 
@@ -475,7 +475,7 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             description_placeholders={"line_name": line_display_name},
         )
 
-    async def async_step_remove_recipient(self, user_input=None) -> FlowResult:
+    async def async_step_remove_recipient(self, user_input=None) -> ConfigFlowResult:
         """Show a dropdown of current recipients and remove the selected one."""
         if not self._recipients:
             return self.async_abort(reason="no_recipients")
@@ -496,7 +496,7 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
             }),
         )
 
-    async def async_step_rotate_token(self, user_input=None) -> FlowResult:
+    async def async_step_rotate_token(self, user_input=None) -> ConfigFlowResult:
         """Replace the Channel Access Token and/or Channel Secret.
 
         Verifies the new token before saving. Both fields are pre-filled with
@@ -535,39 +535,44 @@ class LineMessagingOptionsFlow(config_entries.OptionsFlow):
     def _get_pending_users(self) -> dict:
         """Return the live pending_users dict from the entry's runtime data.
 
-        The runtime dict is the authoritative source during normal operation.
-        It is pre-populated from config entry data at startup so captures
-        survive HA restarts. Returns an empty dict if the entry is not loaded.
+        The runtime dict is the authoritative working copy during normal
+        operation; its persisted backing lives in the Store. The getattr guard
+        covers the brief window where the entry is reloading. Returns an empty
+        dict if the entry is not loaded.
         """
         runtime = getattr(self.config_entry, "runtime_data", None)
         return getattr(runtime, "pending_users", None) or {}
 
     def _get_pending_event(self) -> asyncio.Event | None:
-        """Return the runtime pending_event set by the webhook on capture."""
+        """Return the shared pending_event the webhook sets on each capture."""
+        return self.hass.data.get(DOMAIN, {}).get(KEY_PENDING_EVENT)
+
+    async def _save_pending(self) -> None:
+        """Persist the live pending captures to the Store."""
         runtime = getattr(self.config_entry, "runtime_data", None)
-        return getattr(runtime, "pending_event", None)
+        store = getattr(runtime, "store", None)
+        if store is not None:
+            await store.async_save(dict(self._get_pending_users()))
 
     def _persist(self) -> None:
         """Write current recipients and credentials to the config entry without closing the flow.
 
-        Called after each recipient is confirmed (or pending is cleared) so
-        partial progress is not lost if the user cancels the flow. Preserves
-        any other keys already in entry data, and writes the current in-memory
-        pending_users back so the update listener can detect pending-only
-        writes and skip the reload.
+        Called after each recipient is confirmed so partial progress is not lost
+        if the user cancels the flow. Preserves any other keys already in entry
+        data. Pending captures are persisted separately via the Store, so this
+        only touches credentials and recipients.
         """
         new_data = dict(self.config_entry.data)
         new_data.update({
             CONF_CHANNEL_ACCESS_TOKEN: self._token,
             CONF_CHANNEL_SECRET: self._secret,
             RECIPIENTS_KEY: self._recipients,
-            PENDING_USERS_KEY: dict(self._get_pending_users()),
         })
         self.hass.config_entries.async_update_entry(
             self.config_entry, data=new_data
         )
 
-    def _save(self) -> FlowResult:
+    def _save(self) -> ConfigFlowResult:
         """Persist and close the options flow.
 
         Calls _persist() to write data, then returns async_create_entry to
