@@ -1,11 +1,11 @@
 name: Tests
 
-# Runs the pytest suite on every push and pull request to main.
+# Runs the pytest suite on every push and pull request to main or dev.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 jobs:

@@ -4,7 +4,7 @@ name: Validate
 # (manifest, services, strings, etc.) and the HACS repository structure check.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   schedule:
     # Re-run daily so upstream changes to hassfest/HACS rules are caught early.
